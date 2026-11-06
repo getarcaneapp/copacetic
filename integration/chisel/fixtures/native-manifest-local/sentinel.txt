@@ -1,1 +1,0 @@
-This path is outside the Chisel manifest and must survive re-cut reconciliation.

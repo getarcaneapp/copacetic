@@ -6,12 +6,11 @@ These instructions apply to the entire repository. If a nested `AGENTS.md` is ad
 Keep this guidance practical: prefer the smallest focused change that satisfies the task, and avoid repo-wide rewrites unless explicitly requested.
 
 ## Project overview
-Copacetic (`copa`) is a Go CLI for patching vulnerabilities in existing container images with BuildKit. It updates packages in images without requiring a full source rebuild, usually from a scanner report such as Trivy.
+This is a library-only fork of Copacetic (`copa`), used by Arcane to patch vulnerabilities in existing container images with BuildKit. It updates packages in images without requiring a full source rebuild, usually from a scanner report such as Trivy.
 
-- Module: `github.com/project-copacetic/copacetic`
-- Main CLI entrypoint: `main.go`
-- Primary command: `copa patch -i IMAGE [-r REPORT] -t TAG`
-- BuildKit frontend entrypoint: `cmd/frontend/main.go`
+- Module: `getarcane.dev/copacetic` (upstream: `github.com/project-copacetic/copacetic`)
+- Public API: the root package `copacetic.go` (`Patch`, `Options`, `ErrNoUpdatesFound`, `ResolvePatchedImageName`). Everything else is under `internal/`; keep it that way and expose new API only through the root package.
+- There is no CLI, TUI, BuildKit frontend, docs site, or integration/e2e suite. Do not reintroduce them, or the dependencies they need (cobra, viper, buildx, trivy, testcontainers, k8s, lipgloss, progrock). See `README.md` for what replaced each one.
 
 ## Design and safety guidelines
 - Preserve Copa's design tenets: patch existing images, work with the current container/scanner/package-manager ecosystem, enable remediation by non-image-authors, and keep features composable and narrowly scoped.
@@ -21,36 +20,29 @@ Copacetic (`copa`) is a Go CLI for patching vulnerabilities in existing containe
 - Never commit secrets or credentials. Do not disclose suspected vulnerabilities publicly; follow `SECURITY.md`.
 
 ## Repository map
-- `pkg/cmd/`: Cobra command wiring and patch command flags/validation.
-- `pkg/patch/`: core single-arch and multi-platform patch orchestration.
-- `pkg/buildkit/`: BuildKit client setup, drivers, and platform discovery helpers.
-- `pkg/pkgmgr/`: OS package manager adapters (`apk`, `dpkg`, `rpm`, `pacman`) and scripts/testdata.
-- `pkg/langmgr/`: language/library package patching managers.
-- `pkg/report/`: vulnerability report parsing and scanner plugin interface; Trivy support lives here.
-- `pkg/imageloader/`: Docker/Podman image loading integration.
-- `pkg/frontend/`, `cmd/frontend/`: BuildKit frontend support.
-- `pkg/bulk/`: bulk patch configuration, discovery, and execution.
-- `pkg/generate/`: generation command and related logic.
-- `pkg/provenance/`: provenance detection/rebuild helpers.
-- `pkg/vex/`: VEX/OpenVEX output.
-- `pkg/types/`: shared options, errors, and versioned API types.
-- `pkg/common/`, `pkg/utils/`, `pkg/tui/`: shared helpers, logging/display utilities, and terminal output.
-- `integration/` and `test/e2e/`: Docker/BuildKit-heavy integration and end-to-end tests.
-- `website/docs/`: user documentation; `website/versioned_docs/` contains generated historical docs.
+- `internal/patch/`: core single-arch and multi-platform patch orchestration.
+- `internal/buildkit/`: BuildKit client setup, drivers, and platform discovery helpers.
+- `internal/pkgmgr/`: OS package manager adapters (`apk`, `dpkg`, `rpm`, `pacman`) and scripts/testdata.
+- `internal/langmgr/`: language/library package patching managers.
+- `internal/report/`: vulnerability report parsing and scanner plugin interface; Trivy support lives here, using the local report types in `trivytypes.go`.
+- `internal/imageloader/`: Docker/Podman image loading integration.
+- `internal/provenance/`: provenance detection/rebuild helpers.
+- `internal/vex/`: VEX/OpenVEX output.
+- `internal/types/`: shared options, errors, and versioned API types.
+- `internal/common/`, `internal/utils/`: shared helpers and BuildKit progress display.
+- `internal/patch/manifest.go`: builds and pushes the multi-platform index with go-containerregistry.
 
 ## Build, test, lint, and format
 Use the existing Makefile targets when possible:
 
 - Install local tooling: `make setup` (installs pinned `golangci-lint` and `gofumpt`).
-- Build CLI: `make build`.
-- Run unit tests: `make test` (`go test ./pkg/... $(CODECOV_OPTS)`).
-- Run targeted unit tests while iterating: `go test ./pkg/<package>` or `go test ./pkg/<package> -run <TestName>`.
+- Build: `make build`.
+- Run unit tests: `make test` (`go test ./... $(CODECOV_OPTS)`).
+- Run targeted unit tests while iterating: `go test ./internal/<package>` or `go test ./internal/<package> -run <TestName>`.
 - Lint: `make lint`.
 - Format Go code: `make format`.
 
-Integration and e2e tests (`go test ./integration/...`, `go test ./test/e2e/...`) require Docker/BuildKit/container registry behavior and can be slow or environment-sensitive. Run targeted integration/e2e tests when touching those paths, or explain why they were not run.
-
-For docs site changes under `website/`, use Yarn from that directory when verification is needed, for example `cd website && yarn install --frozen-lockfile && yarn build`.
+`make test` sets `GIT_CONFIG_GLOBAL=/dev/null` because the chisel tests create git commits and fail under a global `commit.gpgsign`. End-to-end patching is verified from Arcane.
 
 ## Go coding conventions
 - Follow the Go version in `go.mod`.
@@ -66,12 +58,11 @@ For docs site changes under `website/`, use Yarn from that directory when verifi
 - Scanner/report changes must preserve the scanner plugin interface and avoid assuming Trivy-only fields unless the code path is explicitly Trivy-specific.
 - Multi-platform changes must preserve manifest-list behavior, target-platform selection, and platform preservation for unaffected images.
 - BuildKit and image-loader changes should keep Docker, Podman, remote BuildKit, and cancellation/timeout behavior in mind.
-- Language/library patching is experimental. Respect `--pkg-types`, `--library-patch-level`, and `--toolchain-patch-level`; when working on CLI flag handling, also respect `COPA_EXPERIMENTAL=1`, but note that BuildKit frontend opts such as `pkg-types` / `library-patch-level` are accepted without that env var. Update relevant language manager tests when changing this area.
+- Language/library patching is experimental. Respect the `PkgTypes`, `LibraryPatchLevel`, and `ToolchainPatchLevel` options. Update relevant language manager tests when changing this area.
 - VEX/provenance changes should not overstate remediation status; only report what the patching flow has actually validated.
 
 ## Documentation and PR expectations
-- Update `README.md` and/or `website/docs/` when changing user-visible CLI behavior, flags, outputs, configuration, supported platforms, or workflows.
-- When updating current website docs (`website/docs`), check whether the latest versioned docs need the same change (`website/versioned_docs`).
+- Update `README.md` when changing the public API, options, outputs, or how the fork differs from upstream.
 - Keep examples aligned with current command names and flags.
 - Contributions are expected to pass `make test`, `make lint`, and `gofumpt` formatting.
 - The project uses Angular-style commit messages for changelog automation and requires DCO signoff (`Signed-off-by`) on real commits.
