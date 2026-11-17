@@ -17,6 +17,10 @@ type indexLookupError struct {
 	source *buildkit.ImageSource
 }
 
+// Error has a pointer receiver so only *indexLookupError is an error; the
+// marker is always created, wrapped and matched by pointer.
+func (err *indexLookupError) Error() string { return err.error.Error() }
+
 func (err *indexLookupError) Unwrap() error { return err.error }
 
 // Keep recovery and child validation on the same access path as source capture.
