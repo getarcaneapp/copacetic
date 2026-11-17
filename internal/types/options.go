@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"github.com/moby/buildkit/util/progress/progressui"
+
+	"getarcane.dev/copacetic/internal/ocilayout"
 )
 
 // Options contains common copacetic options.
@@ -38,13 +40,15 @@ type Options struct {
 	Push             bool
 	Platforms        []string
 	Loader           string
+	InputOCILayout   string
 	OCIDir           string
 	Compression      string
 	ForceCompression bool
+	OCISource        *ocilayout.Source
 
 	// Package types and library patch level
 	PkgTypes          string
-	LibraryPatchLevel string
+	LibraryPatchLevel string // empty when --library-patch-level isn't set
 
 	// Toolchain patch level (e.g., Go stdlib upgrade)
 	ToolchainPatchLevel string

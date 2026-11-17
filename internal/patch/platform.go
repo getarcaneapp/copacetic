@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/containerd/platforms"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -25,7 +28,7 @@ const (
 // For testing: allow stubbing descriptor lookups.
 var (
 	localPlatformDescriptor = utils.LocalPlatformDescriptor
-	getVerifiedRemoteIndex  = buildkit.GetVerifiedRemoteIndex
+	getVerifiedRemoteIndex  = buildkit.GetVerifiedRemoteIndexWithContext
 )
 
 var validPlatforms = []string{
@@ -162,11 +165,16 @@ func platformMatchKey(os, architecture, variant string) string {
 	return os + "\x00" + architecture + "\x00" + variant
 }
 
-// getPlatformDescriptorFromManifest gets the descriptor for a specific platform from a multi-arch manifest.
+// getPlatformDescriptorFromManifest gets the descriptor for a specific platform
+// from an index or a single image manifest.
 func getPlatformDescriptorFromManifest(
+	ctx context.Context,
 	imageRef string,
 	targetPlatform *types.PatchPlatform,
 ) (*ispec.Descriptor, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing reference %q: %w", imageRef, err)
@@ -180,7 +188,7 @@ func getPlatformDescriptorFromManifest(
 	// path for air-gapped patching of images loaded into the daemon (e.g. via
 	// `docker load`) without ever being pushed to a registry.
 	if localDesc, ok, lerr := localPlatformDescriptor(
-		context.Background(),
+		ctx,
 		imageRef,
 		&ispec.Platform{
 			OS:           targetPlatform.OS,
@@ -201,8 +209,11 @@ func getPlatformDescriptorFromManifest(
 		// preserved-platform resolution cannot disagree with discovery. Mutable
 		// local tags remain authoritative and never trigger a remote lookup.
 		if digestRef, immutable := ref.(name.Digest); immutable {
-			desc, err = getVerifiedRemoteIndex(digestRef)
+			desc, err = getVerifiedRemoteIndex(ctx, digestRef)
 			if err != nil {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				log.Debugf("Could not verify matching remote index for locally cached %s: %v", imageRef, err)
 				desc = nil
 			} else {
@@ -226,16 +237,22 @@ func getPlatformDescriptorFromManifest(
 			)
 		}
 	} else {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if lerr != nil {
 			log.Debugf("Local platform descriptor lookup for %s failed: %v", imageRef, lerr)
 		}
 
 		// Image is not available locally — fall back to the legacy local manifest
 		// helper (multi-platform manifest list only) and then to the remote registry.
-		desc, err = buildkit.TryGetManifestFromLocal(ref)
+		desc, err = buildkit.TryGetManifestFromLocalWithContext(ctx, ref)
 		if err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			log.Debugf("Failed to get descriptor from local daemon: %v, trying remote registry", err)
-			desc, err = remote.Get(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+			desc, err = remote.Get(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithContext(ctx))
 			if err != nil {
 				return nil, fmt.Errorf("error fetching descriptor for %q from both local daemon and remote registry: %w", imageRef, err)
 			}
@@ -245,23 +262,45 @@ func getPlatformDescriptorFromManifest(
 		}
 	}
 
-	if !desc.MediaType.IsIndex() {
-		return nil, fmt.Errorf("expected multi-platform image but got single-platform image")
+	if pinned, ok := ref.(name.Digest); ok && desc.Digest.String() != pinned.DigestStr() {
+		return nil, fmt.Errorf("descriptor for %q does not match the requested digest", imageRef)
 	}
 
-	index, err := desc.ImageIndex()
-	if err != nil {
-		return nil, fmt.Errorf("error getting image index: %w", err)
-	}
-
-	manifest, err := index.IndexManifest()
-	if err != nil {
-		return nil, fmt.Errorf("error getting manifest: %w", err)
+	var candidates []v1.Descriptor
+	if desc.MediaType.IsIndex() {
+		index, err := desc.ImageIndex()
+		if err != nil {
+			return nil, fmt.Errorf("error getting image index: %w", err)
+		}
+		manifest, err := index.IndexManifest()
+		if err != nil {
+			return nil, fmt.Errorf("error getting manifest: %w", err)
+		}
+		candidates = manifest.Manifests
+	} else {
+		// Captured platform sources are immutable child manifests. Their
+		// platform is in the config, not in a parent index descriptor.
+		img, err := desc.Image()
+		if err != nil {
+			return nil, fmt.Errorf("error getting platform image: %w", err)
+		}
+		config, err := img.ConfigFile()
+		if err != nil {
+			return nil, fmt.Errorf("error getting platform image config: %w", err)
+		}
+		manifest, err := img.Manifest()
+		if err != nil {
+			return nil, fmt.Errorf("error getting platform image manifest: %w", err)
+		}
+		candidate := desc.Descriptor
+		candidate.Platform = config.Platform()
+		candidate.Annotations = manifest.Annotations
+		candidates = []v1.Descriptor{candidate}
 	}
 
 	// Find the descriptor for the target platform
-	for i := range manifest.Manifests {
-		m := &manifest.Manifests[i]
+	for i := range candidates {
+		m := &candidates[i]
 		if m.Platform == nil {
 			continue
 		}
@@ -299,4 +338,59 @@ func getPlatformDescriptorFromManifest(
 	}
 
 	return nil, fmt.Errorf("platform %s/%s not found in manifest", targetPlatform.OS, targetPlatform.Architecture)
+}
+
+// resolveOCIPlatform applies a CLI/report constraint without dropping the
+// complete identity obtained from the source. Unspecified fields never justify
+// choosing the first of multiple source identities.
+func resolveOCIPlatform(discovered []types.PatchPlatform, target *ispec.Platform) (types.PatchPlatform, error) {
+	constraint := platforms.Normalize(*target)
+	var matches []types.PatchPlatform
+	var available []string
+	for _, candidate := range discovered {
+		actual := platforms.Normalize(candidate.Platform)
+		available = append(available, buildkit.FormatPlatform(actual))
+		if actual.OS != constraint.OS || actual.Architecture != constraint.Architecture || actual.Variant != constraint.Variant {
+			continue
+		}
+		if constraint.OSVersion != "" && actual.OSVersion != constraint.OSVersion {
+			continue
+		}
+		if len(constraint.OSFeatures) > 0 && !slices.Equal(actual.OSFeatures, constraint.OSFeatures) {
+			continue
+		}
+		matches = append(matches, candidate)
+	}
+	if len(matches) != 1 {
+		return types.PatchPlatform{}, fmt.Errorf(
+			"target platform %s matches %d platforms in the selected OCI image; available platforms: %s",
+			buildkit.FormatPlatform(constraint), len(matches), strings.Join(available, ", "),
+		)
+	}
+	return matches[0], nil
+}
+
+func filterOCIPlatforms(discovered []types.PatchPlatform, targets []string) ([]types.PatchPlatform, error) {
+	var selected []types.PatchPlatform
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		parsed, err := platforms.Parse(target)
+		if err != nil {
+			return nil, fmt.Errorf("parse platform %q: %w", target, err)
+		}
+		if !isSupportedPatchPlatform(&parsed) {
+			return nil, fmt.Errorf("unsupported platform %q", target)
+		}
+		match, err := resolveOCIPlatform(discovered, &parsed)
+		if err != nil {
+			return nil, err
+		}
+		key := buildkit.PlatformKey(match.Platform)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		selected = append(selected, match)
+	}
+	return selected, nil
 }

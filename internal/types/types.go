@@ -3,10 +3,85 @@ package types
 import (
 	"github.com/distribution/reference"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"getarcane.dev/copacetic/internal/ocilayout"
 	"getarcane.dev/copacetic/internal/types/unversioned"
 )
+
+const (
+	AnnotationPatchOriginKind   = "sh.copa.patch.origin.kind"
+	AnnotationPatchOriginName   = "sh.copa.patch.origin.name"
+	AnnotationPatchOriginDigest = "sh.copa.patch.origin.digest"
+	PatchOriginImage            = "image-ref"
+	PatchOriginOCI              = "oci-layout"
+)
+
+// SourceLineage identifies the original non-Copa content selected for a patch.
+// Digest is authoritative. OCI origins may omit Name; it must never be a local path.
+type SourceLineage struct {
+	Kind   string
+	Name   string
+	Digest digest.Digest
+}
+
+// Valid reports whether the origin tuple has a supported kind and consistent identity.
+func (lineage *SourceLineage) Valid() bool {
+	if lineage == nil || lineage.Digest.Validate() != nil {
+		return false
+	}
+	if lineage.Kind != PatchOriginImage && lineage.Kind != PatchOriginOCI {
+		return false
+	}
+	if lineage.Name == "" {
+		return lineage.Kind == PatchOriginOCI
+	}
+	named, err := reference.ParseNormalizedNamed(lineage.Name)
+	if err != nil {
+		return false
+	}
+	if pinned, ok := named.(reference.Digested); ok && pinned.Digest() != lineage.Digest {
+		return false
+	}
+	return true
+}
+
+// Annotations returns a complete origin tuple, or nil for an unknown identity.
+func (lineage *SourceLineage) Annotations() map[string]string {
+	if !lineage.Valid() {
+		return nil
+	}
+	annotations := map[string]string{
+		AnnotationPatchOriginKind:   lineage.Kind,
+		AnnotationPatchOriginDigest: lineage.Digest.String(),
+	}
+	if lineage.Name != "" {
+		annotations[AnnotationPatchOriginName] = lineage.Name
+	}
+	return annotations
+}
+
+// SourceLineageFromAnnotations reads only Copa-owned origin metadata.
+// Application-owned org.opencontainers.image.base.* fields are never control data.
+func SourceLineageFromAnnotations(annotations map[string]string) *SourceLineage {
+	lineage := &SourceLineage{
+		Kind:   annotations[AnnotationPatchOriginKind],
+		Name:   annotations[AnnotationPatchOriginName],
+		Digest: digest.Digest(annotations[AnnotationPatchOriginDigest]),
+	}
+	if !lineage.Valid() {
+		return nil
+	}
+	if lineage.Name != "" {
+		named, _ := reference.ParseNormalizedNamed(lineage.Name)
+		if reference.IsNameOnly(named) {
+			named = reference.TagNameOnly(named)
+		}
+		lineage.Name = named.String()
+	}
+	return lineage
+}
 
 type UpdatePackage struct {
 	Name             string `json:"name"`
@@ -46,7 +121,9 @@ func (p PatchPlatform) String() string {
 
 // PlatformVEX is the validated update manifest for one patched platform image.
 // It is set when a report was provided, the patched digest is known, and the
-// validated manifest contains at least one OS or language update.
+// validated manifest contains at least one OS or language update. For OCI
+// layout input the digest comes from the final export, so NameDigestOrTag is
+// empty here and the OCI output path names each product.
 type PlatformVEX struct {
 	// Updates is the validated manifest after errored packages are excluded.
 	Updates *unversioned.UpdateManifest
@@ -58,12 +135,14 @@ type PlatformVEX struct {
 
 // PatchResult represents the result of a single arch patch operation.
 type PatchResult struct {
-	OriginalRef  reference.Named
-	PatchedDesc  *ispec.Descriptor
-	PatchedRef   reference.Named
-	PatchedState *llb.State                // BuildKit state for OCI export
-	ConfigData   []byte                    // Image config data
-	Summary      *unversioned.PatchSummary // Patch summary, nil if unavailable
+	OriginalRef         reference.Named
+	PatchedDesc         *ispec.Descriptor
+	PatchedRef          reference.Named
+	PatchedState        *llb.State                // BuildKit state for OCI export
+	ManifestAnnotations map[string]string         // Manifest-body annotations, separate from PatchedDesc for OCI sources
+	ConfigData          []byte                    // Image config data
+	Summary             *unversioned.PatchSummary // Patch summary, nil if unavailable
+	OCISource           *ocilayout.Source         // Source store retained for OCI-backed state re-solves
 	// VEX is set when this platform was patched and qualifies for a VEX statement.
 	// Nil for preserved, up-to-date, and failed platforms.
 	VEX *PlatformVEX

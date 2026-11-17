@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -30,15 +31,18 @@ import (
 	remoteTypes "github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
 	exptypes "github.com/moby/buildkit/exporter/containerimage/exptypes"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/auth/authprovider"
+	"github.com/moby/buildkit/solver/pb"
 	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	fstypes "github.com/tonistiigi/fsutil/types"
 
 	"getarcane.dev/copacetic/internal/mocks"
+	"getarcane.dev/copacetic/internal/ocilayout"
 	"getarcane.dev/copacetic/internal/types"
 	"getarcane.dev/copacetic/internal/utils"
 
@@ -145,6 +149,270 @@ func TestGetVerifiedRemoteIndex(t *testing.T) {
 	}
 }
 
+func TestResolveImageSourceUsesAuthoritativeLocalDigest(t *testing.T) {
+	const topHex = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	raw := []byte(`{
+		"schemaVersion":2,
+		"mediaType":"application/vnd.oci.image.index.v1+json",
+		"annotations":{"com.example":"preserved"},
+		"manifests":[{
+			"mediaType":"application/vnd.oci.image.manifest.v1+json",
+			"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"size":1,
+			"platform":{"os":"linux","architecture":"amd64"}
+		}]
+	}`)
+
+	originalLocal := tryGetManifestFromLocal
+	originalRemote := getRemoteImageDescriptor
+	t.Cleanup(func() {
+		tryGetManifestFromLocal = originalLocal
+		getRemoteImageDescriptor = originalRemote
+	})
+	tryGetManifestFromLocal = func(context.Context, name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+		return &remote.Descriptor{
+			Descriptor: remotev1.Descriptor{
+				MediaType: remoteTypes.OCIImageIndex,
+				Digest:    remotev1.Hash{Algorithm: "sha256", Hex: strings.Repeat("d", 64)},
+				Size:      int64(len(raw)),
+			},
+			Manifest: raw,
+		}, remotev1.Hash{Algorithm: "sha256", Hex: topHex}, true, nil
+	}
+	remoteCalled := false
+	getRemoteImageDescriptor = func(name.Reference, ...remote.Option) (*remote.Descriptor, error) {
+		remoteCalled = true
+		return nil, errors.New("remote lookup must not occur")
+	}
+
+	source, err := ResolveImageSource(t.Context(), "registry.example.com/team/app:latest")
+	require.NoError(t, err)
+	assert.False(t, remoteCalled)
+	assert.Equal(t, "registry.example.com/team/app:latest", source.Name)
+	assert.Equal(t, "sha256:"+topHex, source.Descriptor.Digest.String())
+	require.NotNil(t, source.Index)
+	assert.Equal(t, "preserved", source.Index.Annotations["com.example"])
+	child, err := source.PlatformDescriptor(&ispec.Platform{OS: "linux", Architecture: "amd64"})
+	require.NoError(t, err)
+	assert.Equal(t, "sha256:"+strings.Repeat("a", 64), child.Digest.String())
+}
+
+func TestResolveImageSourceReconcilesIncompleteLocalIndexByDigest(t *testing.T) {
+	const sourceHex = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	sourceDigest := remotev1.Hash{Algorithm: "sha256", Hex: sourceHex}
+	localIndex := testRemoteIndexDescriptor(sourceHex)
+	remoteIndex := testRemoteIndexDescriptor(sourceHex)
+
+	originalLocal := tryGetManifestFromLocal
+	originalRemote := getRemoteImageDescriptor
+	t.Cleanup(func() {
+		tryGetManifestFromLocal = originalLocal
+		getRemoteImageDescriptor = originalRemote
+	})
+	tryGetManifestFromLocal = func(context.Context, name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+		return localIndex, sourceDigest, false, nil
+	}
+	getRemoteImageDescriptor = func(gotRef name.Reference, _ ...remote.Option) (*remote.Descriptor, error) {
+		assert.Equal(t, "registry.example.com/team/app@"+sourceDigest.String(), gotRef.String())
+		return remoteIndex, nil
+	}
+
+	source, err := ResolveImageSource(t.Context(), "registry.example.com/team/app:latest")
+	require.NoError(t, err)
+	assert.Equal(t, sourceDigest.String(), source.Descriptor.Digest.String())
+	require.NotNil(t, source.Index)
+}
+
+func TestResolveImageSourceCancellation(t *testing.T) {
+	for _, stage := range []string{"daemon inspect", "daemon image", "incomplete index", "cached index", "remote image"} {
+		t.Run(stage, func(t *testing.T) {
+			started := make(chan struct{}, 1)
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/_ping" {
+					w.Header().Set("API-Version", "1.52")
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if r.URL.Path == "/v2/" {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			oldIndex, oldLocal, oldRemote := localImageIndex, tryGetManifestFromLocal, getRemoteImageDescriptor
+			t.Cleanup(func() {
+				localImageIndex, tryGetManifestFromLocal, getRemoteImageDescriptor = oldIndex, oldLocal, oldRemote
+			})
+			input := "example.invalid/app:latest"
+			if stage == "daemon inspect" || stage == "daemon image" {
+				t.Setenv("DOCKER_HOST", "tcp://"+strings.TrimPrefix(server.URL, "http://"))
+				t.Setenv("DOCKER_API_VERSION", "1.52")
+				t.Setenv("DOCKER_TLS_VERIFY", "")
+				getRemoteImageDescriptor = func(name.Reference, ...remote.Option) (*remote.Descriptor, error) {
+					return nil, errors.New("must not fall back to registry after cancellation")
+				}
+				if stage == "daemon image" {
+					localImageIndex = func(context.Context, string) (*ispec.Index, *ispec.Descriptor, bool, bool, error) {
+						return nil, nil, true, true, nil
+					}
+				}
+			} else {
+				top := remotev1.Hash{Algorithm: "sha256", Hex: strings.Repeat("c", 64)}
+				input = strings.TrimPrefix(server.URL, "http://") + "/app@" + top.String()
+				tryGetManifestFromLocal = func(context.Context, name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+					if stage == "remote image" {
+						return nil, remotev1.Hash{}, false, errors.New("no local source")
+					}
+					local := testRemoteIndexDescriptor(top.Hex)
+					if stage == "cached index" {
+						local.MediaType = remoteTypes.OCIManifestSchema1
+						local.Digest.Hex = strings.Repeat("a", 64)
+					}
+					return local, top, stage == "cached index", nil
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+			result := make(chan error, 1)
+			go func() {
+				defer close(done)
+				_, err := ResolveImageSource(ctx, input)
+				result <- err
+			}()
+			defer func() {
+				cancel()
+				close(release)
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Error("source resolution did not exit after releasing fixture")
+				}
+				server.Close()
+			}()
+			select {
+			case <-started:
+			case err := <-result:
+				t.Fatalf("source returned before request started: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("source request did not start")
+			}
+			cancel()
+			select {
+			case err := <-result:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(2 * time.Second):
+				t.Fatal("source request ignored cancellation")
+			}
+		})
+	}
+}
+
+func TestResolveImageSourceExpiredContext(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired=%t", expired), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			want := context.Canceled
+			if expired {
+				cancel()
+				ctx, cancel = context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+				want = context.DeadlineExceeded
+			} else {
+				cancel()
+			}
+			defer cancel()
+			oldLocal, oldRemote := tryGetManifestFromLocal, getRemoteImageDescriptor
+			t.Cleanup(func() { tryGetManifestFromLocal, getRemoteImageDescriptor = oldLocal, oldRemote })
+			tryGetManifestFromLocal = func(context.Context, name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+				t.Error("canceled source must not probe the daemon")
+				return nil, remotev1.Hash{}, false, errors.New("no local source")
+			}
+			getRemoteImageDescriptor = func(name.Reference, ...remote.Option) (*remote.Descriptor, error) {
+				t.Error("canceled source must not probe the registry")
+				return nil, errors.New("no remote source")
+			}
+			_, err := ResolveImageSource(ctx, "example.invalid/app:latest")
+			require.ErrorIs(t, err, want)
+		})
+	}
+}
+
+func TestUpdateImageConfigDataCapturesSelectedBaseLineage(t *testing.T) {
+	ctx := t.Context()
+	t.Run("first patch", func(t *testing.T) {
+		imageDigest := digest.FromString("first-source")
+		configData := []byte(`{"config":{"labels":{}}}`)
+
+		_, patched, baseImage, lineage, validated, err := updateImageConfigData(
+			ctx,
+			&mocks.MockGWClient{},
+			configData,
+			"alpine:3.20",
+			"alpine:3.20",
+			imageDigest,
+			nil,
+		)
+		require.NoError(t, err)
+		assert.Nil(t, patched)
+		assert.Equal(t, "alpine:3.20", baseImage)
+		assert.Equal(t, &types.SourceLineage{Kind: types.PatchOriginImage, Name: "docker.io/library/alpine:3.20", Digest: imageDigest}, lineage)
+		assert.False(t, validated)
+	})
+
+	t.Run("re-patch validates recorded base on requested non-default platform", func(t *testing.T) {
+		baseDigest := digest.FromString("original-base")
+		platform := &ispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}
+		client := &mocks.MockGWClient{}
+		client.On("ResolveImageConfig", mock.Anything, "docker.io/library/alpine@"+baseDigest.String(), mock.Anything).
+			Run(func(args mock.Arguments) {
+				resolveOpt, ok := args.Get(2).(sourceresolver.Opt)
+				require.True(t, ok)
+				require.NotNil(t, resolveOpt.ImageOpt)
+				assert.Equal(t, platform, resolveOpt.ImageOpt.Platform)
+			}).
+			Return("docker.io/library/alpine@"+baseDigest.String(), baseDigest, []byte(`{"architecture":"arm64","variant":"v8","os":"linux","config":{"labels":{}}}`), nil).
+			Once()
+		configData := []byte(fmt.Sprintf(`{"config":{"labels":{"sh.copa.patch.origin.kind":"image-ref","BaseImage":"docker.io/library/alpine@%s","%s":"docker.io/library/alpine:3.20","%s":"%s"}}}`,
+			baseDigest,
+			types.AnnotationPatchOriginName,
+			types.AnnotationPatchOriginDigest,
+			baseDigest,
+		))
+
+		const patchedImage = "registry.example.com/app:patched"
+		_, patched, _, lineage, validated, err := updateImageConfigData(ctx, client, configData, patchedImage, patchedImage, digest.FromString("patched"), platform)
+		require.NoError(t, err)
+		require.NotNil(t, patched)
+		assert.Equal(t, &types.SourceLineage{Kind: types.PatchOriginImage, Name: "docker.io/library/alpine:3.20", Digest: baseDigest}, lineage)
+		assert.True(t, validated)
+		client.AssertExpectations(t)
+	})
+}
+
+func TestCreateFinalOCILayoutIncludesIndexAnnotations(t *testing.T) {
+	outputDir := t.TempDir()
+	annotations := map[string]string{
+		types.AnnotationPatchOriginKind:   types.PatchOriginImage,
+		types.AnnotationPatchOriginName:   "registry.example.com/team/app:1.0",
+		types.AnnotationPatchOriginDigest: digest.FromString("source-index").String(),
+	}
+
+	require.NoError(t, createFinalOCILayout(outputDir, nil, annotations))
+	data, err := os.ReadFile(filepath.Join(outputDir, "index.json"))
+	require.NoError(t, err)
+	var index ispec.Index
+	require.NoError(t, json.Unmarshal(data, &index))
+	assert.Equal(t, annotations, index.Annotations)
+}
+
 func TestTryGetManifestFromLocalUsesDockerIndexMetadata(t *testing.T) {
 	const imageRef = "registry.example.com/local:latest"
 	indexDigest := digest.Digest("sha256:" + strings.Repeat("c", 64))
@@ -171,7 +439,7 @@ func TestTryGetManifestFromLocalUsesDockerIndexMetadata(t *testing.T) {
 
 	ref, err := name.ParseReference(imageRef)
 	require.NoError(t, err)
-	desc, sourceDigest, complete, err := getManifestFromLocal(ref)
+	desc, sourceDigest, complete, err := getManifestFromLocal(t.Context(), ref)
 	require.NoError(t, err)
 	assert.True(t, complete)
 	assert.True(t, desc.MediaType.IsIndex())
@@ -201,7 +469,7 @@ func TestResolvePreservedPlatformsDescriptorKeepsLocalIndexAuthoritative(t *test
 		tryGetManifestFromLocal = originalLocal
 		getRemoteImageDescriptor = originalRemote
 	})
-	tryGetManifestFromLocal = func(name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+	tryGetManifestFromLocal = func(context.Context, name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
 		return localIndex, sourceDigest, true, nil
 	}
 	getRemoteImageDescriptor = func(name.Reference, ...remote.Option) (*remote.Descriptor, error) {
@@ -209,15 +477,15 @@ func TestResolvePreservedPlatformsDescriptorKeepsLocalIndexAuthoritative(t *test
 		return nil, nil
 	}
 
-	got, isLocal, err := resolvePreservedPlatformsDescriptor(ref)
+	got, isLocal, err := resolvePreservedPlatformsDescriptor(t.Context(), ref)
 	require.NoError(t, err)
 	assert.True(t, isLocal)
 	assert.Same(t, localIndex, got)
 
-	tryGetManifestFromLocal = func(name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+	tryGetManifestFromLocal = func(context.Context, name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
 		return localIndex, remotev1.Hash{Algorithm: "sha256", Hex: strings.Repeat("d", 64)}, true, nil
 	}
-	_, _, err = resolvePreservedPlatformsDescriptor(ref)
+	_, _, err = resolvePreservedPlatformsDescriptor(t.Context(), ref)
 	require.ErrorContains(t, err, "does not match immutable reference")
 }
 
@@ -243,7 +511,7 @@ func TestResolvePreservedPlatformsDescriptorReconcilesIncompleteLocalIndex(t *te
 
 	for _, ref := range []name.Reference{immutableRef, mutableRef} {
 		t.Run(ref.Identifier(), func(t *testing.T) {
-			tryGetManifestFromLocal = func(gotRef name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+			tryGetManifestFromLocal = func(_ context.Context, gotRef name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
 				assert.Equal(t, ref.String(), gotRef.String())
 				return localIndex, sourceDigest, false, nil
 			}
@@ -252,7 +520,7 @@ func TestResolvePreservedPlatformsDescriptorReconcilesIncompleteLocalIndex(t *te
 				return remoteIndex, nil
 			}
 
-			got, isLocal, err := resolvePreservedPlatformsDescriptor(ref)
+			got, isLocal, err := resolvePreservedPlatformsDescriptor(t.Context(), ref)
 			require.NoError(t, err)
 			assert.False(t, isLocal)
 			assert.Same(t, remoteIndex, got)
@@ -332,7 +600,7 @@ func TestResolvePreservedPlatformsDescriptorReconcilesImmutableIndex(t *testing.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			remoteCalls := 0
-			tryGetManifestFromLocal = func(gotRef name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+			tryGetManifestFromLocal = func(_ context.Context, gotRef name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
 				assert.Equal(t, tt.ref.String(), gotRef.String())
 				return localChild, localChild.Digest, true, nil
 			}
@@ -342,7 +610,7 @@ func TestResolvePreservedPlatformsDescriptorReconcilesImmutableIndex(t *testing.
 				return tt.remoteDesc, tt.remoteErr
 			}
 
-			got, isLocal, err := resolvePreservedPlatformsDescriptor(tt.ref)
+			got, isLocal, err := resolvePreservedPlatformsDescriptor(t.Context(), tt.ref)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				assert.Nil(t, got)
@@ -392,7 +660,7 @@ func TestCreatePreservedOnlyOCILayoutMaterializesBlobs(t *testing.T) {
 		tryGetManifestFromLocal = originalLocal
 		getRemoteImageDescriptor = originalRemote
 	})
-	tryGetManifestFromLocal = func(name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+	tryGetManifestFromLocal = func(context.Context, name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
 		return nil, remotev1.Hash{}, false, errors.New("image is not available locally")
 	}
 	getRemoteImageDescriptor = remote.Get
@@ -400,10 +668,11 @@ func TestCreatePreservedOnlyOCILayoutMaterializesBlobs(t *testing.T) {
 	originalRef, err := reference.ParseNormalizedNamed(registryRef.String())
 	require.NoError(t, err)
 	outputDir := filepath.Join(t.TempDir(), "layout")
-	err = createPreservedOnlyOCILayout(
+	err = createPreservedOnlyOCILayout(t.Context(),
 		outputDir,
 		[]types.PatchResult{{OriginalRef: originalRef}},
 		[]types.PatchPlatform{{Platform: ispec.Platform{OS: "linux", Architecture: "amd64"}}},
+		OCILayoutExportOptions{},
 	)
 	require.NoError(t, err)
 
@@ -426,6 +695,90 @@ func TestCreatePreservedOnlyOCILayoutMaterializesBlobs(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, compressed.Close()) })
 	_, err = io.Copy(io.Discard, compressed)
 	require.NoError(t, err)
+}
+
+// Strict report discovery, used for OCI layout input, accepts every OS family
+// a Copa package manager can patch, including Arch Linux, and rejects others.
+func TestStrictReportDiscoveryOSFamilies(t *testing.T) {
+	writeReport := func(t *testing.T, family string) string {
+		t.Helper()
+		dir := t.TempDir()
+		report := fmt.Sprintf(`{
+			"SchemaVersion":2,"ArtifactName":"example.com/test/image:latest","ArtifactType":"container_image",
+			"Metadata":{"OS":{"Family":%q,"Name":"1"},"ImageConfig":{"architecture":"amd64"}},
+			"Results":[]
+		}`, family)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "amd64.json"), []byte(report), 0o600))
+		return dir
+	}
+
+	found, err := DiscoverPlatformsFromReportStrict(writeReport(t, "archlinux"), "trivy")
+	require.NoError(t, err)
+	require.Len(t, found, 1)
+	assert.Equal(t, "linux", found[0].OS)
+	assert.Equal(t, "amd64", found[0].Architecture)
+
+	_, err = DiscoverPlatformsFromReportStrict(writeReport(t, "windows"), "trivy")
+	require.ErrorContains(t, err, `unsupported scan report OS "windows"`)
+}
+
+func TestDiscoverPlatformsReportMetadata(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///copa-report-test-no-daemon.sock")
+	server := httptest.NewServer(registry.New())
+	t.Cleanup(server.Close)
+	ref, err := name.NewTag(server.Listener.Addr().String()+"/test/report:latest", name.Insecure)
+	require.NoError(t, err)
+	reportDir := t.TempDir()
+	reportFile := filepath.Join(reportDir, "amd64.json")
+	require.NoError(t, os.WriteFile(reportFile, []byte(`{
+		"SchemaVersion":2,"ArtifactName":"example.com/test/image:latest","ArtifactType":"container_image",
+		"Metadata":{"OS":{"Family":"alpine","Name":"3.21.0"},"ImageConfig":{"architecture":"amd64"}},
+		"Results":[{"Class":"os-pkgs","Type":"alpine","Vulnerabilities":[{
+			"VulnerabilityID":"CVE-2025-46394","PkgName":"busybox","InstalledVersion":"1.37.0-r8","FixedVersion":"1.37.0-r9"
+		}]}]
+	}`), 0o600))
+	image, err := random.Image(128, 1)
+	require.NoError(t, err)
+	platform := &remotev1.Platform{OS: "linux", Architecture: "amd64", OSVersion: "fixture.1", OSFeatures: []string{"b", "a"}}
+	index := mutate.AppendManifests(empty.Index,
+		mutate.IndexAddendum{Add: image, Descriptor: remotev1.Descriptor{Platform: platform}},
+		mutate.IndexAddendum{Add: image, Descriptor: remotev1.Descriptor{Platform: &remotev1.Platform{OS: "linux", Architecture: "386"}}},
+	)
+	require.NoError(t, remote.WriteIndex(ref, index))
+	found, err := DiscoverPlatforms(ref.String(), reportDir, "trivy")
+	require.NoError(t, err)
+	require.Len(t, found, 2)
+	assert.False(t, found[0].ShouldPreserve)
+	assert.Equal(t, reportFile, found[0].ReportFile)
+	assert.Equal(t, platform.OSVersion, found[0].OSVersion)
+	assert.Equal(t, platform.OSFeatures, found[0].OSFeatures)
+	assert.True(t, found[1].ShouldPreserve)
+	assert.Empty(t, found[1].ReportFile)
+
+	// An underspecified report cannot select an arbitrary feature/version variant.
+	other := *platform
+	other.OSVersion = "fixture.2"
+	index = mutate.AppendManifests(index, mutate.IndexAddendum{Add: image, Descriptor: remotev1.Descriptor{Platform: &other}})
+	require.NoError(t, remote.WriteIndex(ref, index))
+	_, err = DiscoverPlatforms(ref.String(), reportDir, "trivy")
+	require.ErrorContains(t, err, "matches 2 image platforms")
+}
+
+func TestPreservedPlatformsSourceRefKeepsCapturedDigestAfterTagMoves(t *testing.T) {
+	mutableRef, err := reference.ParseNormalizedNamed("registry.example.com/team/app:latest")
+	require.NoError(t, err)
+	capturedDigest := digest.FromString("captured-current-index")
+	capturedRef, err := reference.WithDigest(reference.TrimNamed(mutableRef), capturedDigest)
+	require.NoError(t, err)
+	movedRef, err := reference.WithDigest(reference.TrimNamed(mutableRef), digest.FromString("moved-current-index"))
+	require.NoError(t, err)
+
+	got := preservedPlatformsSourceRef(
+		[]types.PatchResult{{OriginalRef: mutableRef}},
+		OCILayoutExportOptions{PreservedSourceRef: capturedRef},
+	)
+	assert.Equal(t, capturedRef.String(), got.String())
+	assert.NotEqual(t, movedRef.String(), got.String(), "a moved mutable tag must not change the preservation source")
 }
 
 func TestDiscoverPlatformsMutableTagKeepsLocalPlatform(t *testing.T) {
@@ -742,8 +1095,11 @@ func TestAddOCIExportMetadata(t *testing.T) {
 	metadata := platformExportMetadata{
 		Config: []byte(`{"architecture":"arm64","os":"linux","config":{"User":"101"}}`),
 		Annotations: map[string]string{
-			"sh.copa.chisel.release": "ubuntu-24.04",
-			"sh.copa.chisel.version": "v1.4.2",
+			"sh.copa.chisel.release":          "ubuntu-24.04",
+			"sh.copa.chisel.version":          "v1.4.2",
+			types.AnnotationPatchOriginKind:   types.PatchOriginImage,
+			types.AnnotationPatchOriginName:   "registry.example.com/team/app:1.0",
+			types.AnnotationPatchOriginDigest: digest.FromString("source-manifest").String(),
 		},
 	}
 
@@ -1113,7 +1469,7 @@ func TestUpdateImageConfigData(t *testing.T) {
 		expectedData := []byte(`{"config": {"labels": {"com.example.label": "value"}, {"BaseImage": "myimage:latest"}}}`)
 		image := "myimage:latest"
 
-		resultConfig, resultPatched, resultImage, err := updateImageConfigData(ctx, mockClient, configData, image)
+		resultConfig, resultPatched, resultImage, _, _, err := updateImageConfigData(ctx, mockClient, configData, image, image, digest.FromString(image), nil)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1135,12 +1491,12 @@ func TestUpdateImageConfigData(t *testing.T) {
 		mockClient := &mocks.MockGWClient{}
 		mockClient.On("ResolveImageConfig",
 			mock.Anything, mock.AnythingOfType("string"), mock.Anything).
-			Return("imageConfigString", digest.Digest("digest"), []byte(`{"config": {"labels": {"BaseImage": "rockylinux:latest"}}}`), nil)
+			Return("imageConfigString", digest.FromString("rockylinux:latest"), []byte(`{"config": {"labels": {"BaseImage": "rockylinux:latest"}}}`), nil)
 
 		configData := []byte(`{"config": {"labels": {"BaseImage": "rockylinux:latest"}}}`)
 		image := "rockylinux:latest"
 
-		resultConfig, _, resultImage, err := updateImageConfigData(ctx, mockClient, configData, image)
+		resultConfig, _, resultImage, _, _, err := updateImageConfigData(ctx, mockClient, configData, image, image, digest.FromString(image), nil)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1156,6 +1512,226 @@ func TestUpdateImageConfigData(t *testing.T) {
 
 		mockClient.AssertExpectations(t)
 	})
+}
+
+func writeOCIInputTestBlob(t *testing.T, root, mediaType string, data []byte) ispec.Descriptor {
+	t.Helper()
+	dgst := digest.FromBytes(data)
+	path := filepath.Join(root, "blobs", dgst.Algorithm().String(), dgst.Encoded())
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	return ispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(data))}
+}
+
+func newOCIInputTestSource(t *testing.T) (*ocilayout.Source, ispec.Descriptor, []byte) {
+	t.Helper()
+	root := t.TempDir()
+	configData := []byte(`{"architecture":"amd64","os":"linux","config":{"Labels":{"BaseImage":"registry.invalid/base:latest","existing":"kept"}},"rootfs":{"type":"layers","diff_ids":[]}}`)
+	configDesc := writeOCIInputTestBlob(t, root, ispec.MediaTypeImageConfig, configData)
+	manifestData, err := json.Marshal(map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ispec.MediaTypeImageManifest,
+		"config":        configDesc,
+		"layers":        []ispec.Descriptor{},
+	})
+	require.NoError(t, err)
+	manifestDesc := writeOCIInputTestBlob(t, root, ispec.MediaTypeImageManifest, manifestData)
+	manifestDesc.Platform = &ispec.Platform{OS: "linux", Architecture: "amd64"}
+	indexData, err := json.Marshal(map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     ispec.MediaTypeImageIndex,
+		"manifests":     []ispec.Descriptor{manifestDesc},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(root, ispec.ImageLayoutFile), []byte(`{"imageLayoutVersion":"1.0.0"}`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ispec.ImageIndexFile), indexData, 0o600))
+
+	source, err := ocilayout.Open(t.Context(), root, filepath.Join(t.TempDir(), "output"), "")
+	require.NoError(t, err)
+	return source, manifestDesc, configData
+}
+
+func TestInitializeBuildkitConfigWithSourceKeepsResolutionLocal(t *testing.T) {
+	source, manifestDesc, configData := newOCIInputTestSource(t)
+	resolvedRef, err := source.ResolveReference()
+	require.NoError(t, err)
+
+	mockClient := &mocks.MockGWClient{}
+	mockClient.On("ResolveImageConfig", mock.Anything, resolvedRef, mock.Anything).
+		Return(resolvedRef, manifestDesc.Digest, configData, nil).
+		Once()
+	config, err := InitializeBuildkitConfigWithSource(t.Context(), mockClient, "example.com/acme/app:latest", "", manifestDesc.Platform, source)
+	require.NoError(t, err)
+	assert.Nil(t, config.PatchedConfigData)
+	var image ispec.Image
+	require.NoError(t, json.Unmarshal(config.ConfigData, &image))
+	assert.Equal(t, "registry.invalid/base:latest", image.Config.Labels["BaseImage"])
+	assert.Equal(t, "kept", image.Config.Labels["existing"])
+	mockClient.AssertExpectations(t)
+
+	solveOpt := client.SolveOpt{}
+	addOCIStores(&solveOpt, OCILayoutExportOptions{state: &ociLayoutExportState{sources: []*ocilayout.Source{source}}})
+	assert.NotNil(t, solveOpt.OCIStores[source.StoreID])
+}
+
+func TestCreatePreservedOnlyOCILayoutFromSourceIsAtomic(t *testing.T) {
+	source, _, _ := newOCIInputTestSource(t)
+	output := filepath.Join(t.TempDir(), "output")
+	platform := types.PatchPlatform{
+		Platform:       ispec.Platform{OS: "linux", Architecture: "amd64"},
+		ShouldPreserve: true,
+	}
+	result := types.PatchResult{
+		OriginalRef: source.Reference,
+		PatchedRef:  source.Reference,
+		PatchedDesc: &source.Descriptor,
+		OCISource:   source,
+	}
+	require.NoError(t, CreateOCILayoutFromResultsWithOptions(
+		output,
+		[]types.PatchResult{result},
+		[]types.PatchPlatform{platform},
+		OCILayoutExportOptions{Atomic: true, OutputReference: "example.com/acme/app:patched"},
+	))
+
+	var index ispec.Index
+	data, err := os.ReadFile(filepath.Join(output, ispec.ImageIndexFile))
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(data, &index))
+	require.Len(t, index.Manifests, 1)
+	assert.Equal(t, ispec.MediaTypeImageIndex, index.Manifests[0].MediaType)
+	assert.Equal(t, "patched", index.Manifests[0].Annotations[ispec.AnnotationRefName])
+	selectedIndexData, err := os.ReadFile(filepath.Join(output, "blobs", index.Manifests[0].Digest.Algorithm().String(), index.Manifests[0].Digest.Encoded()))
+	require.NoError(t, err)
+	var selectedIndex ispec.Index
+	require.NoError(t, json.Unmarshal(selectedIndexData, &selectedIndex))
+	require.Len(t, selectedIndex.Manifests, 1)
+	assert.Equal(t, source.Descriptor.Digest, selectedIndex.Manifests[0].Digest)
+	assert.NotEmpty(t, selectedIndex.Annotations["org.opencontainers.image.created"])
+	assert.NotEmpty(t, selectedIndex.Annotations["sh.copa.patched"])
+	_, err = os.Stat(filepath.Join(output, "blobs", source.Descriptor.Digest.Algorithm().String(), source.Descriptor.Digest.Encoded()))
+	require.NoError(t, err)
+	reopened, err := ocilayout.Open(t.Context(), output, filepath.Join(t.TempDir(), "next-output"), "example.com/acme/app:patched")
+	require.NoError(t, err)
+	platforms, err := reopened.Platforms(t.Context())
+	require.NoError(t, err)
+	require.Len(t, platforms, 1)
+	assert.Equal(t, "amd64", platforms[0].Architecture)
+
+	existingOutput := t.TempDir()
+	err = CreateOCILayoutFromResultsWithOptions(
+		existingOutput,
+		[]types.PatchResult{result},
+		[]types.PatchPlatform{platform},
+		OCILayoutExportOptions{Atomic: true, OutputReference: "example.com/acme/app:patched"},
+	)
+	require.ErrorContains(t, err, "already exists")
+}
+
+func TestOCIPublicationHonorsLateCancellation(t *testing.T) {
+	source, _, _ := newOCIInputTestSource(t)
+	parent := t.TempDir()
+	output := filepath.Join(parent, "output")
+	result := types.PatchResult{OCISource: source, PatchedDesc: &source.Descriptor}
+	platform := types.PatchPlatform{Platform: *source.Descriptor.Platform, ShouldPreserve: true}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	completed := false
+	err := createAtomicOCILayout(ctx, output, func(staging string) error {
+		// Finish a real preserved-layout export, then cancel before publication.
+		err := CreateOCILayoutFromResultsWithOptions(staging,
+			[]types.PatchResult{result}, []types.PatchPlatform{platform},
+			OCILayoutExportOptions{OutputReference: "example.com/app:patched"},
+		)
+		if err != nil {
+			return err
+		}
+		_, err = ocilayout.Open(t.Context(), staging, "", "")
+		require.NoError(t, err)
+		completed = true
+		cancel()
+		return nil
+	})
+	require.True(t, completed)
+	require.ErrorIs(t, err, context.Canceled)
+	entries, err := os.ReadDir(parent)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "late cancellation must remove staging and publish nothing")
+
+	existing := t.TempDir()
+	marker := filepath.Join(existing, "keep")
+	require.NoError(t, os.WriteFile(marker, []byte("unchanged"), 0o600))
+	err = createAtomicOCILayout(ctx, existing, func(string) error {
+		t.Fatal("an existing destination must prevent any writes")
+		return nil
+	})
+	require.ErrorContains(t, err, "already exists")
+	data, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	assert.Equal(t, "unchanged", string(data))
+}
+
+// An atomic export owns the staging directory it is given. The BuildKit export
+// must write into that directory, not remove and recreate it, or another local
+// user could claim the path in between. A named export still replaces the
+// contents of --oci-dir. The solve itself fails here; only the directory
+// handling before it is under test.
+func TestMultiPlatformOCIExportKeepsAtomicStagingDirectory(t *testing.T) {
+	c, err := client.New(t.Context(), "tcp://127.0.0.1:1")
+	require.NoError(t, err)
+	defer c.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	amd64 := ispec.Platform{OS: "linux", Architecture: "amd64"}
+	arm64 := ispec.Platform{OS: "linux", Architecture: "arm64"}
+	for _, platforms := range [][]ispec.Platform{{amd64}, {amd64, arm64}} {
+		for _, atomic := range []bool{true, false} {
+			t.Run(fmt.Sprintf("platforms=%d/atomic=%v", len(platforms), atomic), func(t *testing.T) {
+				staging, err := os.MkdirTemp(t.TempDir(), ".copa-oci-output-*")
+				require.NoError(t, err)
+				marker := filepath.Join(staging, "owned")
+				require.NoError(t, os.WriteFile(marker, nil, 0o600))
+				before, err := os.Lstat(staging)
+				require.NoError(t, err)
+
+				states := make([]llb.State, len(platforms))
+				metadata := make([]platformExportMetadata, len(platforms))
+				for i := range platforms {
+					states[i] = llb.Scratch()
+				}
+				err = solveMultiPlatformOCI(ctx, c, staging, states, platforms, metadata,
+					OCILayoutExportOptions{Atomic: atomic}.WithContext(ctx))
+				require.Error(t, err)
+
+				after, err := os.Lstat(staging)
+				require.NoError(t, err)
+				if atomic {
+					assert.True(t, os.SameFile(before, after), "the staging directory must not be replaced")
+					assert.Equal(t, before.Mode(), after.Mode())
+					assert.FileExists(t, marker)
+					return
+				}
+				assert.NoFileExists(t, marker, "a named export replaces the earlier --oci-dir contents")
+			})
+		}
+	}
+}
+
+func TestCanceledOCIExportRemovesStagingDirectory(t *testing.T) {
+	source, _, _ := newOCIInputTestSource(t)
+	parent := t.TempDir()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := CreateOCILayoutFromResultsWithOptions(filepath.Join(parent, "output"),
+		[]types.PatchResult{{OCISource: source, PatchedDesc: &source.Descriptor}},
+		[]types.PatchPlatform{{Platform: *source.Descriptor.Platform, ShouldPreserve: true}},
+		OCILayoutExportOptions{Atomic: true, OutputReference: "example.com/app:patched"}.WithContext(ctx),
+	)
+	require.ErrorIs(t, err, context.Canceled)
+	entries, err := os.ReadDir(parent)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
 }
 
 func TestMapGoArch(t *testing.T) {
@@ -1192,6 +1768,7 @@ func TestIsSupportedOsType(t *testing.T) {
 		utils.OSTypeOracle,
 		utils.OSTypeRedHat,
 		utils.OSTypeRocky,
+		utils.OSTypeFedora,
 		utils.OSTypeAmazon,
 		utils.OSTypeAlma,
 		utils.OSTypeSLES,
@@ -1475,6 +2052,310 @@ func TestPlatformsFromIndexManifest(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
+func TestPlatformKeyIncludesNormalizedIdentity(t *testing.T) {
+	original := ispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8", OSVersion: "1", OSFeatures: []string{"b", "a"}}
+	normalized := original
+	normalized.Variant = ""
+	normalized.OSFeatures = []string{"a", "b", "a"}
+	assert.Equal(t, PlatformKey(original), PlatformKey(normalized))
+	normalized.OSFeatures = []string{"c"}
+	assert.NotEqual(t, PlatformKey(original), PlatformKey(normalized))
+	normalized = original
+	normalized.OSVersion = "2"
+	assert.NotEqual(t, PlatformKey(original), PlatformKey(normalized))
+}
+
+func TestOCIExportAnnotationScopes(t *testing.T) {
+	patchResult := &types.PatchResult{
+		OCISource:           &ocilayout.Source{},
+		ConfigData:          []byte(`{"architecture":"amd64","os":"linux"}`),
+		PatchedDesc:         &ispec.Descriptor{Annotations: map[string]string{"example.scope": "descriptor"}},
+		ManifestAnnotations: map[string]string{"example.scope": "body"},
+	}
+	metadata := ociPlatformExportMetadata(patchResult)
+	result := gwclient.NewResult()
+	require.NoError(t, addOCIExportMetadata(result, metadata))
+	assert.Equal(t, []byte("body"), result.Metadata[exptypes.AnnotationManifestKey(nil, "example.scope")])
+	assert.Equal(t, []byte("descriptor"), result.Metadata[exptypes.AnnotationManifestDescriptorKey(nil, "example.scope")])
+	assert.Equal(t, "descriptor", patchResult.PatchedDesc.Annotations["example.scope"])
+}
+
+func TestOCIExportRejectsMismatchedSoleResult(t *testing.T) {
+	source, desc, config := newOCIInputTestSource(t)
+	state := llb.Scratch()
+	err := CreateOCILayoutFromResultsWithOptions(filepath.Join(t.TempDir(), "output"),
+		[]types.PatchResult{{OCISource: source, PatchedDesc: &desc, PatchedState: &state, ConfigData: config}},
+		[]types.PatchPlatform{{Platform: ispec.Platform{OS: "linux", Architecture: "arm64"}}},
+		OCILayoutExportOptions{Atomic: true, OutputReference: "registry.invalid/output:patched"},
+	)
+	require.ErrorContains(t, err, "missing OCI patch result for platform")
+}
+
+func TestPlatformKeyAvoidsDelimiterCollisions(t *testing.T) {
+	for _, pair := range [][2]ispec.Platform{
+		{{OS: "linux", Architecture: "amd64", OSVersion: `1+["x"]`}, {OS: "linux", Architecture: "amd64", OSVersion: "1", OSFeatures: []string{"x"}}},
+		{{OS: "linux/amd64", Architecture: "v8"}, {OS: "linux", Architecture: "amd64", Variant: "v8"}},
+		{{OS: "linux", Architecture: "amd64@1"}, {OS: "linux", Architecture: "amd64", OSVersion: "1"}},
+		{{OS: "linux", Architecture: "amd64", Variant: "v1@2"}, {OS: "linux", Architecture: "amd64", Variant: "v1", OSVersion: "2"}},
+		{{OS: "linux", Architecture: "amd64", OSFeatures: []string{"a,b"}}, {OS: "linux", Architecture: "amd64", OSFeatures: []string{"a", "b"}}},
+	} {
+		assert.NotEqual(t, PlatformKey(pair[0]), PlatformKey(pair[1]), "%+v must remain distinct from %+v", pair[0], pair[1])
+	}
+	assert.Equal(t,
+		PlatformKey(ispec.Platform{OS: "linux", Architecture: "amd64"}),
+		PlatformKey(ispec.Platform{OS: "linux", Architecture: "amd64", OSFeatures: []string{}}),
+	)
+}
+
+func TestFormatPlatformPreservesDisplay(t *testing.T) {
+	for _, test := range []struct {
+		platform ispec.Platform
+		want     string
+	}{
+		{ispec.Platform{OS: "linux", Architecture: "amd64"}, "linux/amd64"},
+		{ispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}, "linux/arm64"},
+		{ispec.Platform{OS: "windows", Architecture: "amd64", OSVersion: "10.0.1"}, "windows/amd64@10.0.1"},
+		{ispec.Platform{OS: "linux", Architecture: "amd64", OSVersion: "1", OSFeatures: []string{"b", "a"}}, `linux/amd64@1+["a","b"]`},
+	} {
+		assert.Equal(t, test.want, FormatPlatform(test.platform))
+	}
+}
+
+func TestResolveRecordedOrigin(t *testing.T) {
+	source := "example.com/app:stable"
+	original := digest.FromString("A")
+	lineage := &types.SourceLineage{Kind: types.PatchOriginImage, Name: source, Digest: original}
+	opt := sourceresolver.Opt{ImageOpt: &sourceresolver.ResolveImageOpt{ResolveMode: llb.ResolveModePreferLocal.String(), Platform: &ispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}}}
+	cfg := []byte(`{"config":{"Labels":{}}}`)
+	for _, tc := range []struct {
+		name         string
+		selected     digest.Digest
+		resolveErr   error
+		immutableErr error
+		recovered    digest.Digest
+		wantErr      bool
+	}{
+		{name: "retain matching local locator", selected: original},
+		{name: "reused output tag", selected: digest.FromString("P1"), recovered: original},
+		{name: "moved tag", selected: digest.FromString("C"), recovered: original},
+		{name: "removed tag", resolveErr: errors.New("tag gone"), recovered: original},
+		{name: "original unavailable", selected: digest.FromString("P1"), immutableErr: errors.New("original gone"), wantErr: true},
+		{name: "immutable source mismatch", selected: digest.FromString("P1"), recovered: digest.FromString("C"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &mocks.MockGWClient{}
+			client.On("ResolveImageConfig", mock.Anything, source, opt).Return(source, tc.selected, cfg, tc.resolveErr).Once()
+			wantRef := source
+			if tc.selected != original || tc.resolveErr != nil {
+				wantRef = "example.com/app@" + original.String()
+				client.On("ResolveImageConfig", mock.Anything, wantRef, opt).Return(wantRef, tc.recovered, cfg, tc.immutableErr).Once()
+			}
+			ref, selected, got, err := resolveRecordedOrigin(t.Context(), client, source, lineage, opt)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, wantRef, ref)
+				assert.Equal(t, original, selected)
+				assert.Equal(t, cfg, got)
+			}
+			client.AssertExpectations(t)
+		})
+	}
+	t.Run("reject repository mismatch before resolution", func(t *testing.T) {
+		client := &mocks.MockGWClient{}
+		_, _, _, err := resolveRecordedOrigin(t.Context(), client, "attacker.example.com/app:stable", lineage, opt)
+		require.Error(t, err)
+		client.AssertNotCalled(t, "ResolveImageConfig", mock.Anything, mock.Anything, mock.Anything)
+	})
+}
+
+func TestResolveRecordedOriginImmutableIndex(t *testing.T) {
+	original := digest.FromString("original platform manifest")
+	indexRef := "example.com/app@" + digest.FromString("original index").String()
+	originRef := "example.com/app@" + original.String()
+	lineage := &types.SourceLineage{Kind: types.PatchOriginImage, Name: originRef, Digest: original}
+	opt := sourceresolver.Opt{ImageOpt: &sourceresolver.ResolveImageOpt{
+		ResolveMode: llb.ResolveModePreferLocal.String(),
+		Platform:    &ispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"},
+	}}
+	config := []byte(`{"config":{"Labels":{}}}`)
+	for _, tc := range []struct {
+		name     string
+		selected digest.Digest
+		err      error
+		wantErr  bool
+	}{
+		{name: "selected child matches origin", selected: original},
+		{name: "selected child contradicts origin", selected: digest.FromString("different child"), wantErr: true},
+		{name: "index cannot be resolved", err: errors.New("index unavailable"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &mocks.MockGWClient{}
+			client.On("ResolveImageConfig", mock.Anything, indexRef, opt).Return(indexRef, tc.selected, config, tc.err).Once()
+			ref, selected, got, err := resolveRecordedOrigin(t.Context(), client, indexRef, lineage, opt)
+			if tc.wantErr {
+				require.ErrorContains(t, err, "immutable BaseImage")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, indexRef, ref)
+				assert.Equal(t, original, selected)
+				assert.Equal(t, config, got)
+			}
+			client.AssertExpectations(t)
+			client.AssertNotCalled(t, "ResolveImageConfig", mock.Anything, originRef, mock.Anything)
+		})
+	}
+}
+
+func TestResolveRecordedOriginTopLevelIndex(t *testing.T) {
+	original := digest.FromString("original platform manifest")
+	indexDigest := digest.FromString("original index")
+	indexRef := "example.com/app@" + indexDigest.String()
+	originRef := "example.com/app@" + original.String()
+	lineage := &types.SourceLineage{Kind: types.PatchOriginImage, Name: originRef, Digest: original}
+	platform := &ispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}
+	opt := sourceresolver.Opt{ImageOpt: &sourceresolver.ResolveImageOpt{ResolveMode: llb.ResolveModePreferLocal.String(), Platform: platform}}
+	config := []byte(`{"config":{"Labels":{}}}`)
+	oldLocal, oldRemote := tryGetManifestFromLocal, getRemoteImageDescriptor
+	t.Cleanup(func() { tryGetManifestFromLocal, getRemoteImageDescriptor = oldLocal, oldRemote })
+	tryGetManifestFromLocal = func(context.Context, name.Reference) (*remote.Descriptor, remotev1.Hash, bool, error) {
+		return nil, remotev1.Hash{}, false, errors.New("no local image")
+	}
+	for _, tc := range []struct {
+		name          string
+		child         digest.Digest
+		unavailable   bool
+		wrongIndex    bool
+		wrongPlatform bool
+		wrongConfig   bool
+		wantErr       bool
+	}{
+		{name: "top-level digest selects recorded child", child: original},
+		{name: "index contains another child", child: digest.FromString("other"), wantErr: true},
+		{name: "index content unavailable", child: original, unavailable: true, wantErr: true},
+		{name: "index digest differs", child: original, wrongIndex: true, wantErr: true},
+		{name: "recorded child belongs to another platform", child: original, wrongPlatform: true, wantErr: true},
+		{name: "selected config differs", child: original, wrongConfig: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			childPlatform := *platform
+			if tc.wrongPlatform {
+				childPlatform.Architecture = "amd64"
+			}
+			raw, err := json.Marshal(ispec.Index{Manifests: []ispec.Descriptor{{MediaType: ispec.MediaTypeImageManifest, Digest: tc.child, Platform: &childPlatform}}})
+			require.NoError(t, err)
+			getRemoteImageDescriptor = func(ref name.Reference, _ ...remote.Option) (*remote.Descriptor, error) {
+				require.Equal(t, indexRef, ref.Name())
+				if tc.unavailable {
+					return nil, errors.New("index gone")
+				}
+				hash, err := remotev1.NewHash(indexDigest.String())
+				require.NoError(t, err)
+				if tc.wrongIndex {
+					hash.Hex = digest.FromString("another index").Encoded()
+				}
+				return &remote.Descriptor{Descriptor: remotev1.Descriptor{Digest: hash, MediaType: remoteTypes.OCIImageIndex}, Manifest: raw}, nil
+			}
+			client := &mocks.MockGWClient{}
+			client.On("ResolveImageConfig", mock.Anything, indexRef, opt).Return(indexRef, indexDigest, config, nil).Once()
+			if !tc.wantErr || tc.wrongConfig {
+				childConfig := config
+				if tc.wrongConfig {
+					childConfig = []byte(`{"config":{"Labels":{"different":"true"}}}`)
+				}
+				client.On("ResolveImageConfig", mock.Anything, originRef, opt).Return(originRef, original, childConfig, nil).Once()
+			}
+			ref, selected, got, err := resolveRecordedOrigin(t.Context(), client, indexRef, lineage, opt)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, indexRef, ref)
+				assert.Equal(t, original, selected)
+				assert.Equal(t, config, got)
+			}
+			client.AssertExpectations(t)
+		})
+	}
+}
+
+func TestUpdateImageConfigDataOriginFailurePolicy(t *testing.T) {
+	original := digest.FromString("unavailable-original")
+	lineage := &types.SourceLineage{Kind: types.PatchOriginImage, Name: "example.com/app:original", Digest: original}
+	config := []byte(`{"config":{"Labels":{"BaseImage":"example.com/app:original","org.opencontainers.image.base.name":"example.com/os:base"}}}`)
+	modern, err := AddImageConfigLabels(config, lineage.Annotations())
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name   string
+		config []byte
+		modern bool
+	}{
+		{"new origin fails", modern, true}, {"legacy remains best effort", config, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &mocks.MockGWClient{}
+			client.On("ResolveImageConfig", mock.Anything, mock.Anything, mock.Anything).Return("", digest.Digest(""), []byte(nil), errors.New("not found"))
+			got, patched, ref, origin, validated, err := updateImageConfigData(t.Context(), client, tc.config, "example.com/app:patched", "example.com/app:patched", digest.FromString("P1"), nil)
+			if tc.modern {
+				require.ErrorContains(t, err, "restore the original image")
+				return
+			}
+			require.NoError(t, err)
+			require.Nil(t, patched)
+			require.Nil(t, origin)
+			require.False(t, validated)
+			require.Equal(t, "example.com/app:patched", ref)
+			document, err := parseImageConfigLabels(got)
+			require.NoError(t, err)
+			require.Equal(t, "example.com/app:patched", document.labels["BaseImage"])
+			require.Equal(t, "example.com/os:base", document.labels[ispec.AnnotationBaseImageName])
+		})
+	}
+	malformed := []byte(`{"config":{"Labels":{"BaseImage":"example.com/app:original","sh.copa.patch.origin.kind":"image-ref"}}}`)
+	_, _, _, _, _, err = updateImageConfigData(t.Context(), &mocks.MockGWClient{}, malformed, "example.com/app:patched", "example.com/app:patched", digest.FromString("P1"), nil)
+	require.ErrorContains(t, err, "invalid patch origin metadata")
+}
+
+func TestNewSourceLineageNormalizesSelectedChild(t *testing.T) {
+	selected := digest.FromString("selected child")
+	lineage := newSourceLineage("example.com/app@"+digest.FromString("index").String(), selected)
+	require.True(t, lineage.Valid())
+	require.Equal(t, "example.com/app@"+selected.String(), lineage.Name)
+}
+
+type originMetadataGateway struct {
+	gwclient.Client
+	t        *testing.T
+	platform *ispec.Platform
+	calls    int
+}
+
+func (c *originMetadataGateway) ResolveImageConfig(context.Context, string, sourceresolver.Opt) (string, digest.Digest, []byte, error) {
+	return "", "", nil, errors.New("legacy image adapter must not be used for source identity")
+}
+
+func (c *originMetadataGateway) ResolveSourceMetadata(_ context.Context, op *pb.SourceOp, opt sourceresolver.Opt) (*sourceresolver.MetaResponse, error) {
+	c.calls++
+	require.Contains(c.t, []string{"docker-image://example.com/app:local", "docker-image://example.com/app@" + digest.FromString("local image").String()}, op.Identifier)
+	require.NotNil(c.t, opt.ImageOpt)
+	require.Equal(c.t, llb.ResolveModePreferLocal.String(), opt.ImageOpt.ResolveMode)
+	require.Equal(c.t, c.platform, opt.ImageOpt.Platform)
+	cfg := []byte(`{"architecture":"arm64","os":"linux","config":{"Labels":{}}}`)
+	return &sourceresolver.MetaResponse{Op: op, Image: &sourceresolver.ResolveImageResponse{Digest: digest.FromString("local image"), Config: cfg}}, nil
+}
+
+func TestInitializeBuildkitConfigPreservesSourceResolveOptions(t *testing.T) {
+	platform := &ispec.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}
+	gateway := &originMetadataGateway{t: t, platform: platform}
+	cfg, err := InitializeBuildkitConfig(t.Context(), gateway, "example.com/app:local", platform)
+	require.NoError(t, err)
+	require.Equal(t, digest.FromString("local image"), cfg.SourceLineage.Digest)
+	_, err = cfg.ImageState.Marshal(t.Context(), llb.Platform(*platform))
+	require.NoError(t, err)
+	require.Positive(t, gateway.calls)
+}
+
 func TestEnsureAuthSessionAttachesDockerCredentials(t *testing.T) {
 	t.Run("attaches a session when none is set", func(t *testing.T) {
 		solveOpt := &client.SolveOpt{
@@ -1500,4 +2381,88 @@ func TestEnsureAuthSessionAttachesDockerCredentials(t *testing.T) {
 	t.Run("tolerates a nil solveOpt", func(t *testing.T) {
 		assert.NotPanics(t, func() { ensureAuthSession(nil) })
 	})
+}
+
+func TestOCIPublicationPreservesConcurrentDestination(t *testing.T) {
+	for _, kind := range []string{"directory", "file", "dangling symlink", "directory symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			source, _, _ := newOCIInputTestSource(t)
+			parent := t.TempDir()
+			output := filepath.Join(parent, "output")
+			target := filepath.Join(t.TempDir(), "target")
+			var before os.FileInfo
+			err := createAtomicOCILayout(t.Context(), output, func(staging string) error {
+				// Complete a real layout before another writer claims the destination.
+				if err := CreateOCILayoutFromResultsWithOptions(staging,
+					[]types.PatchResult{{OCISource: source, PatchedDesc: &source.Descriptor}},
+					[]types.PatchPlatform{{Platform: *source.Descriptor.Platform, ShouldPreserve: true}},
+					OCILayoutExportOptions{OutputReference: "example.com/app:patched"},
+				); err != nil {
+					return err
+				}
+				_, err := ocilayout.Open(t.Context(), staging, "", "")
+				require.NoError(t, err)
+				switch kind {
+				case "directory":
+					require.NoError(t, os.Mkdir(output, 0o700))
+				case "file":
+					require.NoError(t, os.WriteFile(output, []byte("keep"), 0o600))
+				case "dangling symlink":
+					require.NoError(t, os.Symlink(target, output))
+				case "directory symlink":
+					require.NoError(t, os.Mkdir(target, 0o700))
+					require.NoError(t, os.Symlink(target, output))
+				}
+				before, err = os.Lstat(output)
+				require.NoError(t, err)
+				return nil
+			})
+			require.NotNil(t, before, "the competing destination was created after the initial check")
+			assert.Error(t, err)
+			after, err := os.Lstat(output)
+			require.NoError(t, err)
+			assert.True(t, os.SameFile(before, after), "publication must not replace the competing destination")
+			assert.Equal(t, before.Mode(), after.Mode())
+			switch kind {
+			case "directory":
+				entries, err := os.ReadDir(output)
+				require.NoError(t, err)
+				assert.Empty(t, entries)
+			case "file":
+				data, err := os.ReadFile(output)
+				require.NoError(t, err)
+				assert.Equal(t, "keep", string(data))
+			default:
+				actualTarget, err := os.Readlink(output)
+				require.NoError(t, err)
+				assert.Equal(t, target, actualTarget)
+			}
+			entries, err := os.ReadDir(parent)
+			require.NoError(t, err)
+			require.Len(t, entries, 1, "publication failure removes only its staging directory")
+			assert.Equal(t, "output", entries[0].Name())
+		})
+	}
+}
+
+func TestOCIPublicationRejectsExistingDanglingSymlink(t *testing.T) {
+	parent := t.TempDir()
+	output, target := filepath.Join(parent, "output"), filepath.Join(parent, "missing")
+	require.NoError(t, os.Symlink(target, output))
+	called := false
+	err := createAtomicOCILayout(t.Context(), output, func(string) error {
+		called = true
+		return nil
+	})
+	assert.ErrorContains(t, err, "already exists")
+	assert.False(t, called, "an existing symlink must reject before the writer runs")
+	actualTarget, err := os.Readlink(output)
+	require.NoError(t, err)
+	assert.Equal(t, target, actualTarget)
+	_, err = os.Lstat(target)
+	assert.True(t, os.IsNotExist(err))
+	entries, err := os.ReadDir(parent)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "output", entries[0].Name())
 }

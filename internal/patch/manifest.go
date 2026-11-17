@@ -21,7 +21,6 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"getarcane.dev/copacetic/internal/types"
-	"getarcane.dev/copacetic/internal/utils"
 )
 
 const (
@@ -40,9 +39,11 @@ func createMultiPlatformManifest(
 	ctx context.Context,
 	imageName reference.NamedTagged,
 	items []types.PatchResult,
-	originalImage string,
+	originalAnnotations map[string]string,
+	indexLineage *types.SourceLineage,
 ) error {
-	now := time.Now().UTC().Format(time.RFC3339)
+	created := time.Now().UTC()
+	now := created.Format(time.RFC3339)
 
 	descs, err := indexDescriptors(ctx, items)
 	if err != nil {
@@ -61,7 +62,7 @@ func createMultiPlatformManifest(
 			Versioned:   index.Versioned,
 			MediaType:   ocispec.MediaTypeImageIndex,
 			Manifests:   stampPatchedDescriptors(descs, items, now),
-			Annotations: buildIndexAnnotations(ctx, originalImage, imageName.Tag(), now),
+			Annotations: multiPlatformIndexAnnotations(imageName, originalAnnotations, indexLineage, created),
 		}
 	}
 
@@ -101,33 +102,25 @@ func createMultiPlatformManifest(
 	return nil
 }
 
-// buildIndexAnnotations carries the original index annotations over to the
-// patched index, refreshing the creation time, the version, and Copa's marker.
-func buildIndexAnnotations(ctx context.Context, originalImage, patchedTag, now string) map[string]string {
-	// This lookup is safe here (after per-platform patches have been built and
-	// pushed) because per-platform pushes go to architecture-suffixed tags such
-	// as `image:tag-amd64` (see archTag in pkg/patch/single.go), not to the
-	// source `originalImage` tag. The source tag is not overwritten until the
-	// index push, by which point the annotations have been read.
-	original, err := utils.GetIndexManifestAnnotations(ctx, originalImage)
-	switch {
-	case err != nil:
-		log.Warnf("Failed to get original image annotations: %v", err)
-	case len(original) == 0:
-		log.Info("No annotations found in original image, adding Copa annotations only")
-	default:
-		log.Infof("Retrieved %d annotations from original image %s", len(original), originalImage)
-	}
+// multiPlatformIndexAnnotations carries the original index annotations over to
+// the patched index. It replaces Copa-owned origin metadata with indexLineage
+// and refreshes the creation time, the version, and Copa's marker.
+func multiPlatformIndexAnnotations(
+	imageName reference.NamedTagged,
+	originalAnnotations map[string]string,
+	indexLineage *types.SourceLineage,
+	created time.Time,
+) map[string]string {
+	// Replace only Copa-owned origin metadata; preserve application base.*.
+	annotations := withoutSourceLineageAnnotations(originalAnnotations)
+	maps.Copy(annotations, sourceLineageAnnotations(indexLineage))
 
-	annotations := maps.Clone(original)
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-	if version, ok := annotations[annotationVersion]; ok {
-		annotations[annotationVersion] = rewriteVersionAnnotation(version, patchedTag)
-	}
+	now := created.UTC().Format(time.RFC3339)
 	annotations[annotationCreated] = now
 	annotations[copaAnnotationKeyPrefix+".patched"] = now
+	if version, ok := annotations[annotationVersion]; ok {
+		annotations[annotationVersion] = rewriteVersionAnnotation(version, imageName.Tag())
+	}
 	return annotations
 }
 
