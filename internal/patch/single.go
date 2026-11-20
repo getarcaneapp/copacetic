@@ -422,6 +422,13 @@ func patchSingleArchImageWithSourceAndUpdates(
 		return nil
 	})
 
+	failureLog := &common.FailureLog{}
+	progressCh := make(chan *client.SolveStatus, 128)
+	eg.Go(func() error {
+		failureLog.Tee(buildCtx, buildChannel, progressCh)
+		return nil
+	})
+
 	// Display progress - either forward to shared channel or display locally
 	if sharedProgressCh != nil {
 		// Forward progress to shared channel with platform prefix
@@ -429,12 +436,12 @@ func patchSingleArchImageWithSourceAndUpdates(
 		hostPlatform := platforms.Normalize(platforms.DefaultSpec())
 		platformPrefix := emulationPrefix(hostPlatform.Architecture, targetPlatform.Architecture, targetPlatform.Variant)
 		eg.Go(func() error {
-			common.ForwardProgressWithPrefix(buildCtx, buildChannel, sharedProgressCh, platformPrefix)
+			common.ForwardProgressWithPrefix(buildCtx, progressCh, sharedProgressCh, platformPrefix)
 			return nil
 		})
 	} else {
 		// Display progress locally (single-arch mode)
-		common.DisplayProgress(buildCtx, eg, buildChannel, opts.Progress)
+		common.DisplayProgress(buildCtx, eg, progressCh, opts.Progress)
 	}
 
 	// Handle image loading if not pushing
@@ -461,7 +468,7 @@ func patchSingleArchImageWithSourceAndUpdates(
 			}
 			return res, types.ErrNoUpdatesFound
 		}
-		return nil, err
+		return nil, failureLog.Annotate(err)
 	}
 
 	// Get patched descriptor and add annotations, including preserved states

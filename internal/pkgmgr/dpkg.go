@@ -444,7 +444,7 @@ func (dm *dpkgManager) probeDPKGStatus(ctx context.Context, toolImage string, pl
 		llb.ResolveModeDefault,
 	)
 	updated := toolingBase.Run(
-		llb.Shlex("apt-get -o Acquire::Retries=3 update"),
+		llb.Shlex("apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update"),
 		llb.WithProxy(utils.GetProxy()),
 		llb.IgnoreCache,
 		llb.WithCustomName("Updating package database"),

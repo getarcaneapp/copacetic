@@ -2,6 +2,7 @@ package common
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -289,4 +290,36 @@ func TestForwardProgressWithPrefixReturnsOnCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ForwardProgressWithPrefix did not return after context cancellation")
 	}
+}
+
+func TestFailureLogAnnotate(t *testing.T) {
+	failed := digest.FromString("failed")
+	passed := digest.FromString("passed")
+	src := make(chan *client.SolveStatus, 2)
+	dst := make(chan *client.SolveStatus, 2)
+	src <- &client.SolveStatus{
+		Logs: []*client.VertexLog{
+			{Vertex: passed, Data: []byte("Get:1 http://deb.debian.org/debian stable InRelease\n")},
+			{Vertex: failed, Data: []byte("E: Failed to fetch InRelease\n\nE: Some index files failed to download.\n")},
+		},
+	}
+	src <- &client.SolveStatus{
+		Vertexes: []*client.Vertex{
+			{Digest: passed},
+			{Digest: failed, Error: "exit code: 100"},
+		},
+	}
+	close(src)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	failureLog := &FailureLog{}
+	failureLog.Tee(ctx, src, dst)
+
+	solveErr := errors.New("failed to solve")
+	err := failureLog.Annotate(solveErr)
+	assert.ErrorIs(t, err, solveErr)
+	assert.Equal(t, "failed to solve\nE: Failed to fetch InRelease\nE: Some index files failed to download.", err.Error())
+	assert.Same(t, solveErr, (&FailureLog{}).Annotate(solveErr))
+	assert.NoError(t, failureLog.Annotate(nil))
 }

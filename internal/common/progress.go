@@ -2,7 +2,10 @@ package common
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
+	"sync"
 
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/util/progress/progressui"
@@ -29,6 +32,102 @@ func DisplayProgress(ctx context.Context, eg *errgroup.Group, buildChannel chan 
 		_, err = display.UpdateFrom(ctx, buildChannel)
 		return err
 	})
+}
+
+const (
+	failureLogMaxBytes = 4096
+	failureLogMaxLines = 15
+)
+
+// FailureLog records BuildKit step output so a failed step's log can be attached to the build error.
+type FailureLog struct {
+	mu     sync.Mutex
+	output map[digest.Digest][]byte
+	failed []digest.Digest
+}
+
+// Tee records every status from src and forwards it to dst, closing dst when done.
+func (f *FailureLog) Tee(ctx context.Context, src <-chan *client.SolveStatus, dst chan<- *client.SolveStatus) {
+	defer close(dst)
+	for {
+		select {
+		case status, ok := <-src:
+			if !ok {
+				return
+			}
+			f.record(status)
+			select {
+			case dst <- status:
+			case <-ctx.Done():
+			}
+		case <-ctx.Done():
+			for {
+				select {
+				case status, ok := <-src:
+					if !ok {
+						return
+					}
+					f.record(status)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (f *FailureLog) record(status *client.SolveStatus) {
+	if status == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.output == nil {
+		f.output = make(map[digest.Digest][]byte)
+	}
+	for _, l := range status.Logs {
+		out := f.output[l.Vertex]
+		out = append(out, l.Data...)
+		if len(out) > failureLogMaxBytes {
+			out = out[len(out)-failureLogMaxBytes:]
+		}
+		f.output[l.Vertex] = out
+	}
+	for _, v := range status.Vertexes {
+		if v.Error == "" || strings.Contains(v.Error, context.Canceled.Error()) {
+			continue
+		}
+		f.failed = append(f.failed, v.Digest)
+	}
+}
+
+// Annotate appends the last output lines of the failed steps to err.
+func (f *FailureLog) Annotate(err error) error {
+	if err == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := make(map[digest.Digest]struct{})
+	var lines []string
+	for _, d := range f.failed {
+		if _, ok := seen[d]; ok {
+			continue
+		}
+		seen[d] = struct{}{}
+		for line := range strings.SplitSeq(string(f.output[d]), "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				lines = append(lines, line)
+			}
+		}
+	}
+	if len(lines) == 0 {
+		return err
+	}
+	if len(lines) > failureLogMaxLines {
+		lines = lines[len(lines)-failureLogMaxLines:]
+	}
+	return fmt.Errorf("%w\n%s", err, strings.Join(lines, "\n"))
 }
 
 // ForwardProgressWithPrefix forwards progress from src to dst, prefixing vertex names with the given prefix.
