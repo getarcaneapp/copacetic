@@ -76,6 +76,7 @@ download_external_full_status_closure() {
     [ "$#" -gt 0 ] || return 0
 
     if ! apt-get \
+        -o APT::Sandbox::User=root \
         -o Acquire::Retries=3 \
         -o "Dir::State::status=$RESOLVER_STATUS_FILE" \
         -o "Dir::Cache::archives=$DOWNLOAD_DIR" \
@@ -91,7 +92,7 @@ download_external_full_status_closure() {
 
 : > "$RESULT_MANIFEST"
 
-apt-get -o Acquire::Retries=3 update
+apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 update
 mkdir -p "$DOWNLOAD_DIR/partial"
 if [ "$DPKG_INSTALLATION_MODE" = "external-full-status" ]; then
     if [ ! -s "$RESOLVER_STATUS_FILE" ]; then
@@ -100,7 +101,7 @@ if [ "$DPKG_INSTALLATION_MODE" = "external-full-status" ]; then
     fi
     download_external_full_status_closure
 else
-    apt-get -o Acquire::Retries=3 download --no-install-recommends -- "$@"
+    apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 download --no-install-recommends -- "$@"
 fi
 
 package_identity_matches() {
@@ -176,7 +177,7 @@ download_original_archive() {
     fi
 
     doa_download_dir=$(mktemp -d "$original_archives_dir/download.XXXXXX")
-    if ! (cd "$doa_download_dir" && apt-get -o Acquire::Retries=3 download -- "$doa_request" >&2); then
+    if ! (cd "$doa_download_dir" && apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 download -- "$doa_request" >&2); then
         echo "unable to obtain installed archive for $doa_identity version $doa_installed_version" >&2
         return 1
     fi

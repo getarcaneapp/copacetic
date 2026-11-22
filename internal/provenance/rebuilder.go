@@ -929,7 +929,7 @@ func (r *Rebuilder) buildBinaryWithUpdates(
 
 	// Install git (needed for go mod download)
 	state = state.Run(
-		llb.Args([]string{"sh", "-c", "apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*"}),
+		llb.Args([]string{"sh", "-c", "apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*"}),
 	).Root()
 
 	// Record all scanner-fixed versions as requirements in one edit. Applying

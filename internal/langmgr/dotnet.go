@@ -395,7 +395,9 @@ cat /patch/patch.csproj'`, patchCsproj)
 	).Root()
 
 	// Restore and publish to extract the fixed DLLs, then install jq for deps.json manipulation
-	restoreAndPublishCmd := `sh -c 'cd /patch && dotnet restore && dotnet publish -c Release -o /output && apt-get update -qq && apt-get install -qq -y jq >/dev/null 2>&1'`
+	restoreAndPublishCmd := `sh -c 'cd /patch && dotnet restore && dotnet publish -c Release -o /output ` +
+		`&& apt-get -o APT::Sandbox::User=root update -qq ` +
+		`&& apt-get -o APT::Sandbox::User=root install -qq -y jq >/dev/null 2>&1'`
 	publishedDLLs := projectCreated.Run(
 		llb.Shlex(restoreAndPublishCmd),
 		llb.WithProxy(utils.GetProxy()),

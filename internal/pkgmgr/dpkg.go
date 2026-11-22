@@ -444,13 +444,13 @@ func (dm *dpkgManager) probeDPKGStatus(ctx context.Context, toolImage string, pl
 		llb.ResolveModeDefault,
 	)
 	updated := toolingBase.Run(
-		llb.Shlex("apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update"),
+		llb.Shlex("apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update"),
 		llb.WithProxy(utils.GetProxy()),
 		llb.IgnoreCache,
 		llb.WithCustomName("Updating package database"),
 	).Root()
 
-	const installBusyBoxCmd = "apt-get -o Acquire::Retries=3 install -y busybox-static"
+	const installBusyBoxCmd = "apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 install -y busybox-static"
 	busyBoxInstalled := updated.Run(
 		llb.Shlex(installBusyBoxCmd),
 		llb.WithProxy(utils.GetProxy()),
@@ -1701,7 +1701,7 @@ func (dm *dpkgManager) installUpdates(ctx context.Context, updates unversioned.U
 	}
 
 	aptGetUpdated := imageStateCurrent.Run(
-		llb.Shlex("apt-get -o Acquire::Retries=3 update"),
+		llb.Shlex("apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 update"),
 		llb.WithProxy(utils.GetProxy()),
 		llb.IgnoreCache,
 		llb.WithCustomName("Updating package database"),
@@ -1752,7 +1752,7 @@ func (dm *dpkgManager) installUpdates(ctx context.Context, updates unversioned.U
 		if err := ValidateOSPackageNames(updates); err != nil {
 			return nil, nil, fmt.Errorf("package name validation failed: %w", err)
 		}
-		aptGetInstallTemplate := `sh -c "apt-get -o Acquire::Retries=3 install --no-install-recommends -y %s && apt-get clean -y"`
+		aptGetInstallTemplate := `sh -c "apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 install --no-install-recommends -y %s && apt-get clean -y"`
 		pkgStrings := []string{}
 		for _, u := range updates {
 			pkgStrings = append(pkgStrings, u.Name)
@@ -1760,7 +1760,8 @@ func (dm *dpkgManager) installUpdates(ctx context.Context, updates unversioned.U
 		installCmd = fmt.Sprintf(aptGetInstallTemplate, strings.Join(pkgStrings, " "))
 	} else {
 		// if updates is not specified, update all packages
-		installCmd = `sh -c "output=$(apt-get -o Acquire::Retries=3 upgrade -y && apt-get clean -y && apt-get autoremove -y 2>&1); if [ $? -ne 0 ]; then echo "$output" >>error_log.txt; fi"`
+		installCmd = `sh -c "output=$(apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 upgrade -y ` +
+			`&& apt-get clean -y && apt-get autoremove -y 2>&1); if [ $? -ne 0 ]; then echo "$output" >>error_log.txt; fi"`
 	}
 
 	var customName string
@@ -1875,12 +1876,12 @@ func (dm *dpkgManager) unpackAndMergeUpdates(ctx context.Context, updates unvers
 	for _, architecture := range foreignArchitectures {
 		fmt.Fprintf(&toolingSetup, "dpkg --add-architecture %s && ", architecture)
 	}
-	toolingSetup.WriteString("apt-get -o Acquire::Retries=3 update")
+	toolingSetup.WriteString("apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 update")
 	toolingSetupCommand := toolingSetup.String()
 	if dm.installationMode == dpkgInstallationModeExternalFullStatus {
 		// BusyBox supplies root-confined metadata helpers while temporary
 		// lifecycle-package payloads are removed after the script-free install.
-		toolingSetupCommand += " && apt-get -o Acquire::Retries=3 install -y busybox-static"
+		toolingSetupCommand += " && apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 install -y busybox-static"
 	}
 	updated := toolingBase.Run(
 		buildkit.Sh(toolingSetupCommand),
@@ -1957,7 +1958,7 @@ func (dm *dpkgManager) unpackAndMergeUpdates(ctx context.Context, updates unvers
                             rm -rf /var/lib/dpkg/info
                             mkdir -p /var/lib/dpkg/info
 
-                            apt-get -o Acquire::Retries=3 update
+                            apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 update
 
                             while IFS='|' read -r pkg_name installed_version selection extra || [ -n "${pkg_name}${installed_version}${selection}${extra}" ]; do
                                 if [ -z "$pkg_name" ] || [ -z "$installed_version" ] || [ -z "$selection" ] || [ -n "$extra" ]; then
@@ -1969,10 +1970,10 @@ func (dm *dpkgManager) unpackAndMergeUpdates(ctx context.Context, updates unvers
                                     install) ;;
                                     *) echo "invalid package selection: $selection" >&2; exit 1 ;;
                                 esac
-                                apt-get -o Acquire::Retries=3 install --reinstall -y -- "$pkg_name"
+                                apt-get -o APT::Sandbox::User=root -o Acquire::Retries=3 install --reinstall -y -- "$pkg_name"
                             done < /copa-dpkg-installed-packages
 
-                            apt --fix-broken install -y
+                            apt -o APT::Sandbox::User=root --fix-broken install -y
                             dpkg --configure -a
                             apt-get check
                         `,
